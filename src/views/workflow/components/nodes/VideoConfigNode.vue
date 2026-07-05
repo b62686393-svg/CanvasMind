@@ -1,0 +1,244 @@
+<script setup lang="ts">
+/**
+ * 视频配置节点 - 模型/比例/时长选择 + 生成
+ */
+import { ref, computed, watch, onMounted } from 'vue'
+import { Handle, Position, useVueFlow } from '@vue-flow/core'
+import {
+  updateNode,
+  removeNode,
+  duplicateNode,
+  addNode,
+  addEdge,
+  nodes,
+  edges,
+  type WorkflowCanvasNode,
+  type WorkflowVideoConfigNodeData,
+} from '../../composables/useWorkflowCanvas'
+import WfNodeTitle from '../WfNodeTitle.vue'
+import { VIDEO_RATIO_LIST, getAllVideoModels, getDefaultVideoModelKey, getModelByName, loadPublicModelCatalog } from '@/config/models'
+import { resolveGatewayUpstream } from '@/api/ai-gateway'
+import { createVideoTask, pollVideoTask } from '../../api/video'
+import WfSelect from '@/components/common/WfSelect.vue'
+
+const props = defineProps<{
+  id: string
+  data: WorkflowVideoConfigNodeData & { selected?: boolean }
+}>()
+const { updateNodeInternals } = useVueFlow()
+
+const showActions = ref(false)
+const isGenerating = ref(false)
+const progress = ref(0)
+
+interface WorkflowVideoModelLike {
+  ratios?: string[]
+  durs?: Array<{ label: string; key: number | string }>
+}
+
+const isTextNode = (node?: WorkflowCanvasNode): node is WorkflowCanvasNode<'text'> => node?.type === 'text'
+const isImageNode = (node?: WorkflowCanvasNode): node is WorkflowCanvasNode<'image'> => node?.type === 'image'
+const readImageRole = (data: unknown) => (data && typeof data === 'object' && 'imageRole' in data
+  ? String((data as { imageRole?: string }).imageRole || 'input_reference')
+  : 'input_reference')
+const readVideoResultUrl = (result: { data?: Array<{ url?: string }> | Record<string, unknown> | null; url?: string }) => {
+  if (Array.isArray(result.data)) {
+    return result.data[0]?.url || result.url
+  }
+  return result.url
+}
+
+const model = ref(props.data?.model || getDefaultVideoModelKey())
+const ratio = ref(props.data?.ratio || '16x9')
+const duration = ref(props.data?.duration || 5)
+
+const currentModel = computed<WorkflowVideoModelLike | null>(() => getModelByName(model.value) as WorkflowVideoModelLike | null)
+const modelOptions = computed(() => getAllVideoModels().map(m => ({ label: m.label, value: m.key })))
+const ratioOptions = computed(() => (currentModel.value?.ratios || []).map((r) => {
+  const item = VIDEO_RATIO_LIST.find(v => v.key === r)
+  return { label: item?.label || r, value: r }
+}))
+const durationOptions = computed(() => (currentModel.value?.durs || []).map((d) => ({ label: d.label, value: d.key })))
+
+// 连接的输入
+const promptCount = computed(() => edges.value.filter(e => e.target === props.id && (e.type === 'promptOrder' || !e.type)).length)
+
+watch(
+  [() => props.data?.model, () => props.data?.ratio, () => props.data?.duration],
+  ([m, r, d]) => {
+    if (m !== undefined) model.value = m
+    if (r !== undefined) ratio.value = r
+    if (d !== undefined) duration.value = d
+  },
+)
+
+onMounted(() => {
+  void loadPublicModelCatalog()
+})
+
+const updateConfig = () => {
+  updateNode(props.id, { model: model.value, ratio: ratio.value, duration: duration.value })
+}
+
+// 收集输入
+const collectInputs = () => {
+  const incoming = edges.value.filter(e => e.target === props.id)
+  let prompt = ''
+  const images: Array<{ url: string; role: string }> = []
+
+  for (const edge of incoming) {
+    const src = nodes.value.find(n => n.id === edge.source)
+    if (!src) continue
+    if (isTextNode(src) && src.data.content) prompt = src.data.content
+    if (isImageNode(src) && src.data.url) {
+      images.push({ url: src.data.url, role: readImageRole(edge.data) })
+    }
+  }
+  return { prompt, images }
+}
+
+const handleGenerate = async () => {
+  const { prompt, images } = collectInputs()
+  if (!prompt && !images.length) return
+
+  isGenerating.value = true
+  progress.value = 0
+  let outputNodeId: string | null = null
+
+  try {
+    const { providerId, modelKey } = await resolveGatewayUpstream('video', {
+      modelValue: model.value,
+    })
+    const formData = new FormData()
+    formData.append('model', modelKey)
+    if (prompt) formData.append('prompt', prompt)
+    formData.append('ratio', ratio.value)
+    formData.append('duration', String(duration.value))
+
+    for (const img of images) {
+      if (img.url.startsWith('data:') || img.url.startsWith('blob:')) {
+        const res = await fetch(img.url)
+        const blob = await res.blob()
+        formData.append(img.role, blob, 'image.png')
+      } else {
+        formData.append(img.role, img.url)
+      }
+    }
+
+    // 先创建带 loading 状态的输出节点
+    const node = nodes.value.find(n => n.id === props.id)
+    outputNodeId = addNode('video', {
+      x: (node?.position?.x || 0) + 400,
+      y: node?.position?.y || 0
+    }, { url: '', label: '视频生成中...', loading: true })
+    addEdge({ source: props.id, target: outputNodeId, sourceHandle: 'right', targetHandle: 'left' })
+    const createdOutputNodeId = outputNodeId
+    setTimeout(() => updateNodeInternals([createdOutputNodeId]), 50)
+
+    const task = await createVideoTask(formData)
+    const taskId = task?.id || task?.task_id
+
+    if (taskId && providerId) {
+      const result = await pollVideoTask(taskId, providerId)
+      const videoUrl = readVideoResultUrl(result)
+
+      if (videoUrl) {
+        updateNode(outputNodeId, { url: videoUrl, label: '生成视频', loading: false })
+        updateNode(props.id, { executed: true, outputNodeId: outputNodeId || undefined })
+      } else {
+        updateNode(outputNodeId, { label: '生成失败', loading: false, error: '未返回视频' })
+        updateNode(props.id, { error: '未返回视频' })
+      }
+    } else if (taskId) {
+      updateNode(outputNodeId, { label: '生成失败', loading: false, error: '未匹配到视频厂商配置' })
+      updateNode(props.id, { error: '未匹配到视频厂商配置' })
+    } else {
+      updateNode(outputNodeId, { label: '生成失败', loading: false, error: '任务创建失败' })
+      updateNode(props.id, { error: '任务创建失败' })
+    }
+  } catch (err: unknown) {
+    console.error('视频生成失败:', err)
+    const msg = err instanceof Error ? err.message : '视频生成失败'
+    if (outputNodeId) updateNode(outputNodeId, { label: '生成失败', loading: false, error: msg })
+    updateNode(props.id, { error: msg })
+  } finally {
+    isGenerating.value = false
+  }
+}
+
+const handleDelete = () => removeNode(props.id)
+const handleDuplicate = () => {
+  const newId = duplicateNode(props.id)
+  if (newId) setTimeout(() => updateNodeInternals([newId]), 50)
+}
+
+// 监听自动执行标志
+watch(
+  () => props.data?.autoExecute,
+  (shouldExecute) => {
+    if (shouldExecute && !isGenerating.value) {
+      updateNode(props.id, { autoExecute: false })
+      setTimeout(() => handleGenerate(), 200)
+    }
+  }
+)
+</script>
+
+<template>
+  <div class="wf-node-wrapper" @mouseenter="showActions = true" @mouseleave="showActions = false">
+    <div class="wf-node wf-node-video-config" :class="{ selected: data.selected }">
+      <div class="wf-node-header">
+        <div class="wf-node-header-left">
+          <span class="wf-node-header-icon">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+              <path d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </span>
+          <WfNodeTitle :node-id="id" :label="data.label" placeholder="视频生成" />
+        </div>
+        <button class="wf-btn wf-btn-sm" @click="handleDelete">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M18 6L6 18M6 6l12 12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+
+      <div class="wf-node-body" style="display: flex; flex-direction: column; gap: 8px;">
+        <div style="font-size: 11px; color: var(--text-tertiary);">输入: {{ promptCount }}</div>
+
+        <div>
+          <label class="wf-node-label">模型</label>
+          <WfSelect v-model="model" :options="modelOptions" @change="updateConfig" />
+        </div>
+
+        <div v-if="ratioOptions.length">
+          <label class="wf-node-label">比例</label>
+          <WfSelect v-model="ratio" :options="ratioOptions" @change="updateConfig" />
+        </div>
+
+        <div v-if="durationOptions.length">
+          <label class="wf-node-label">时长</label>
+          <WfSelect v-model="duration" :options="durationOptions" @change="updateConfig" />
+        </div>
+
+        <button class="wf-node-generate-btn amber" :disabled="isGenerating" @click="handleGenerate">
+          <span v-if="isGenerating" class="wf-spinner"></span>
+          <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M13 10V3L4 14h7v7l9-11h-7z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          {{ isGenerating ? '生成中...' : '生成视频' }}
+        </button>
+      </div>
+
+      <Handle type="target" :position="Position.Left" id="left" />
+      <Handle type="source" :position="Position.Right" id="right" />
+    </div>
+
+    <div v-show="showActions" class="wf-node-actions">
+      <button class="wf-node-action-btn" @click="handleDuplicate">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><rect x="9" y="9" width="13" height="13" rx="2" stroke="currentColor" stroke-width="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" stroke="currentColor" stroke-width="2"/></svg>
+        <span>复制</span>
+      </button>
+      <button class="wf-node-action-btn" @click="handleDelete">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>删除</span>
+      </button>
+    </div>
+  </div>
+</template>

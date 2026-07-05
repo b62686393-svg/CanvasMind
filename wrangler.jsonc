@@ -1,0 +1,45 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "canvasmind",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-06-01",
+
+  // ─── Container 定义 ───────────────────────────────────────────
+  // 复用项目根目录的 Dockerfile 构建镜像，后端业务逻辑零改动。
+  "containers": [
+    {
+      "class_name": "CanvasMindContainer",
+      "image": "./Dockerfile",
+      "max_instances": 1,
+      "name": "canvasmind-app"
+    }
+  ],
+
+  // ─── Durable Object 绑定（Container 通过 DO 编排） ──────────
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CANVASMIND_CONTAINER",
+        "class_name": "CanvasMindContainer"
+      }
+    ]
+  },
+
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["CanvasMindContainer"]
+    }
+  ],
+
+  // ─── 非敏感环境变量（注入到容器进程） ──────────────────────
+  "vars": {
+    "APP_PORT": "5409",
+    "STATIC_DIST_DIR": "/app/dist",
+    "UPLOADS_DIR": "/app/uploads",
+    "NODE_ENV": "production",
+    "AUTH_LOGIN_CODE_EXPIRE_MINUTES": "5",
+    "AUTH_SESSION_EXPIRE_DAYS": "30",
+    "REDIS_ENABLED": "false"
+  }
+}

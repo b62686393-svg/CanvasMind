@@ -1,0 +1,104 @@
+/**
+ * AI 网关前端请求封装
+ * 前端只请求同源网关，由网关再转发到用户配置的第三方厂商地址。
+ */
+
+import {
+  type AiEndpointType,
+} from './provider-config'
+import {
+  AI_GATEWAY_REQUEST_PATH,
+  createGatewayPayload,
+  normalizeGatewayMethod,
+  resolveGatewayUpstream,
+} from './ai-gateway'
+import { buildApiUrl } from './http'
+import { handleUnauthorizedResponse, readApiErrorMessage } from './response'
+import { MARKETING_POINTS_UPDATED_EVENT } from '@/stores/marketing-center'
+
+interface RequestOptions {
+  url: string
+  method?: string
+  data?: unknown
+  headers?: Record<string, string>
+  providerId?: string
+  modelKey?: string
+  signal?: AbortSignal
+}
+const isFormData = (value: unknown): value is FormData => typeof FormData !== 'undefined' && value instanceof FormData
+
+
+const notifyMarketingPointsUpdated = (response: Response) => {
+  if (typeof window === 'undefined') return
+  if (response.headers.get('x-marketing-points-updated') !== '1') return
+  window.dispatchEvent(new CustomEvent(MARKETING_POINTS_UPDATED_EVENT))
+}
+
+/**
+ * 通用 JSON/表单请求，统一走同源 AI 网关。
+ */
+export const request = async (
+  options: RequestOptions,
+  type: AiEndpointType = 'video',
+) => {
+  if (isFormData(options.data)) {
+    const formData = new FormData()
+    options.data.forEach((value, key) => {
+      formData.append(key, value)
+    })
+    const originalModel = String(formData.get('model') || '').trim()
+    const { providerId, modelKey } = await resolveGatewayUpstream(type, {
+      providerId: options.providerId,
+      modelKey: options.modelKey,
+      modelValue: originalModel,
+    })
+
+    if (modelKey) {
+      formData.set('model', modelKey)
+    }
+    const response = await fetch(buildApiUrl(AI_GATEWAY_REQUEST_PATH), {
+      method: 'POST',
+      // AI 网关依赖会话 Cookie 判断登录态，这里必须显式携带凭证。
+      credentials: 'include',
+      signal: options.signal,
+      headers: {
+        'x-upstream-provider-id': providerId,
+        'x-upstream-endpoint-type': type,
+        ...(modelKey ? { 'x-upstream-model-key': modelKey } : {}),
+        'x-upstream-method': normalizeGatewayMethod(options.method),
+      },
+      body: formData,
+    })
+
+    notifyMarketingPointsUpdated(response)
+
+    if (!response.ok) {
+      handleUnauthorizedResponse(response.status, 'gateway-form-request')
+      const { message: msg } = await readApiErrorMessage(response)
+      throw new Error(msg)
+    }
+
+    return response.json()
+  }
+
+  const response = await fetch(buildApiUrl(AI_GATEWAY_REQUEST_PATH), {
+    method: 'POST',
+    // AI 网关依赖会话 Cookie 判断登录态，这里必须显式携带凭证。
+    credentials: 'include',
+    signal: options.signal,
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(await createGatewayPayload(type, options)),
+  })
+
+  notifyMarketingPointsUpdated(response)
+
+  if (!response.ok) {
+    handleUnauthorizedResponse(response.status, 'gateway-json-request')
+    const { message: msg } = await readApiErrorMessage(response)
+    throw new Error(msg)
+  }
+
+  return response.json()
+}

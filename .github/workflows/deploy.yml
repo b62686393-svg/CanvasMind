@@ -1,0 +1,141 @@
+name: Docker 部署
+
+on:
+  workflow_run:
+    workflows:
+      - Docker 镜像发布
+    types:
+      - completed
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: 拉取最新镜像并重启容器
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 校验部署密钥
+        run: |
+          if [ -z "${{ secrets.SERVER_HOST }}" ]; then
+            echo "缺少 GitHub Secrets: SERVER_HOST"
+            exit 1
+          fi
+
+          if [ -z "${{ secrets.SERVER_USERNAME }}" ]; then
+            echo "缺少 GitHub Secrets: SERVER_USERNAME"
+            exit 1
+          fi
+
+          if [ -z "${{ secrets.SERVER_SSH_KEY }}" ]; then
+            echo "缺少 GitHub Secrets: SERVER_SSH_KEY"
+            exit 1
+          fi
+
+          if [ -z "${{ secrets.DEPLOY_PATH }}" ]; then
+            echo "缺少 GitHub Secrets: DEPLOY_PATH"
+            exit 1
+          fi
+
+          if [ -z "${{ secrets.DATABASE_URL }}" ]; then
+            echo "缺少 GitHub Secrets: DATABASE_URL"
+            exit 1
+          fi
+
+          if [ -z "${{ secrets.PROVIDER_CONFIG_SECRET }}" ]; then
+            echo "缺少 GitHub Secrets: PROVIDER_CONFIG_SECRET"
+            exit 1
+          fi
+
+          if [ -z "${{ secrets.VITE_API_BASE_URL }}" ]; then
+            echo "缺少 GitHub Secrets: VITE_API_BASE_URL"
+            exit 1
+          fi
+
+          if [ -z "${{ secrets.CORS_ALLOWED_ORIGINS }}" ]; then
+            echo "缺少 GitHub Secrets: CORS_ALLOWED_ORIGINS"
+            exit 1
+          fi
+
+      - name: 初始化部署目录
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USERNAME }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          script: |
+            set -eux
+            DEPLOY_DIR="${{ secrets.DEPLOY_PATH }}"
+            mkdir -p "$DEPLOY_DIR"
+
+      - name: 上传 docker-compose.yml
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USERNAME }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          source: docker-compose.yml
+          target: ${{ secrets.DEPLOY_PATH }}
+          strip_components: 0
+
+      - name: 通过 SSH 部署 Docker 容器
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USERNAME }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          script: |
+            set -eux
+
+            DEPLOY_DIR="${{ secrets.DEPLOY_PATH }}"
+            mkdir -p "$DEPLOY_DIR"
+            cd "$DEPLOY_DIR"
+
+            cat > .env <<'EOF'
+            SERVER_PORT=5409
+            VITE_API_BASE_URL=${{ secrets.VITE_API_BASE_URL }}
+            VITE_PROVIDER_DEFAULT_BASE_URL=https://api.chatfire.site/v1
+            STATIC_DIST_DIR=/app/dist
+            UPLOADS_DIR=/app/uploads
+            CORS_ALLOWED_ORIGINS=${{ secrets.CORS_ALLOWED_ORIGINS }}
+            DATABASE_URL=${{ secrets.DATABASE_URL }}
+            PROVIDER_CONFIG_SECRET=${{ secrets.PROVIDER_CONFIG_SECRET }}
+            STORAGE_CONFIG_SECRET=${{ secrets.STORAGE_CONFIG_SECRET }}
+            REDIS_ENABLED=${{ secrets.REDIS_ENABLED }}
+            REDIS_HOST=${{ secrets.REDIS_HOST }}
+            REDIS_PORT=${{ secrets.REDIS_PORT }}
+            REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD }}
+            REDIS_DATABASE=${{ secrets.REDIS_DATABASE }}
+            REDIS_PREFIX=canana
+            REDIS_ENV=production
+            REDIS_DEFAULT_TTL_SECONDS=60
+            REDIS_TASK_RUNTIME_TTL_SECONDS=1800
+            REDIS_TASK_SNAPSHOT_TTL_SECONDS=1800
+            REDIS_TASK_ABORT_TTL_SECONDS=300
+            REDIS_TASK_LOCK_TTL_MS=30000
+            AUTH_LOGIN_CODE_EXPIRE_MINUTES=5
+            AUTH_SESSION_EXPIRE_DAYS=30
+            EOF
+            
+            ls -la
+            # 清理历史遗留的同名容器，避免旧部署方式残留导致 compose 重建失败。
+            docker rm -f canana-vue-app || true
+            docker compose pull
+            docker compose up -d --force-recreate --remove-orphans
+            docker image prune -f
+            docker ps
+
+      - name: 发送部署通知
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "✅ Docker 部署成功！"
+          else
+            echo "❌ Docker 部署失败！"
+          fi

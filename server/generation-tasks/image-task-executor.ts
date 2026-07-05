@@ -1,0 +1,185 @@
+import type { GenerationTaskStartPayload, GenerationTaskStreamEvent } from './shared'
+import type { GenerationRecordPayload } from '../generation-records/shared'
+
+type ImageExecutionTask = {
+  recordId: string
+  userId: string
+  abortController: AbortController
+}
+
+type ImageTaskRetryState = {
+  attempt: number
+  waitDurationMs: number
+  status: number
+  errorPreview: string
+  stage: string
+}
+
+export interface ImageTaskExecutorContext {
+  syncSharedTaskRuntime: (task: ImageExecutionTask, status: 'running' | 'completed') => Promise<void>
+  ensureTaskNotAborted: (task: ImageExecutionTask) => Promise<void>
+  emitTaskProgressEvent: (recordId: string, input: {
+    stage: string
+    stopped?: boolean
+    message?: string
+  }) => void
+  markTaskRetryState: (task: ImageExecutionTask, input: ImageTaskRetryState) => Promise<void>
+  /**
+   * 从模型配置查询单次允许的最大出图张数（capabilityJson.maxImagesPerRequest）。
+   * 用于在调上游前做"可信兜底 clamp"，不依赖前端发的字段，避免被绕过。
+   */
+  resolveImageMaxImagesPerRequest: (providerId: string, modelKey: string) => Promise<number>
+  requestImageGeneration: (input: {
+    signal: AbortSignal
+    providerId: string
+    modelKey: string
+    requestBody: Record<string, unknown>
+    onRetry?: (retryState: ImageTaskRetryState) => Promise<void> | void
+  }) => Promise<{ upstreamUrl: string; imageUrls: string[] }>
+  requestImageEdit: (input: {
+    signal: AbortSignal
+    providerId: string
+    modelKey: string
+    prompt: string
+    size?: string
+    count?: number
+    referenceImages: string[]
+    onRetry?: (retryState: ImageTaskRetryState) => Promise<void> | void
+  }) => Promise<{ upstreamUrl: string; imageUrls: string[] }>
+  buildInitialRecordPayload: (payload: GenerationTaskStartPayload) => GenerationRecordPayload
+  updateGenerationRecord: (recordId: string, payload: GenerationRecordPayload, currentUserId: string) => Promise<void>
+  getGenerationRecordById: (recordId: string, currentUserId: string) => Promise<Record<string, unknown>>
+  emitTaskStreamEvent: (recordId: string, event: GenerationTaskStreamEvent) => void
+  logGenerationTask: (stage: string, detail: Record<string, unknown>) => void
+}
+
+// 独立承接图片任务执行主干，便于后续继续把图片链路从 service.ts 中抽离。
+export const executeImageTask = async (
+  task: ImageExecutionTask,
+  payload: GenerationTaskStartPayload,
+  context: ImageTaskExecutorContext,
+) => {
+  await context.syncSharedTaskRuntime(task, 'running')
+  await context.ensureTaskNotAborted(task)
+  const modelKey = String(payload.modelKey || '').trim()
+  if (!modelKey) {
+    throw new Error('缺少图片模型标识')
+  }
+
+  const providerId = String((payload.requestBody || {}).providerId || '').trim()
+  if (!providerId) {
+    throw new Error('缺少图片厂商配置')
+  }
+
+  context.emitTaskProgressEvent(task.recordId, {
+    stage: 'resolved_provider',
+    message: '已解析厂商与模型配置，准备请求上游图片接口',
+  })
+
+  const requestMode = String(payload.requestMode || '').trim() === 'image-edit'
+    ? 'image-edit'
+    : 'image-generation'
+  const referenceImages = Array.isArray(payload.referenceImages)
+    ? payload.referenceImages.map(item => String(item || '').trim()).filter(Boolean)
+    : []
+  const requestBody = {
+    ...(payload.requestBody || {}),
+    model: modelKey,
+  }
+
+  context.logGenerationTask('image_task:request_start', {
+    recordId: task.recordId,
+    userId: task.userId,
+    modelKey,
+    requestMode,
+    referenceImageCount: referenceImages.length,
+  })
+  context.emitTaskProgressEvent(task.recordId, {
+    stage: 'requesting_upstream',
+    message: '已开始请求上游图片模型',
+  })
+
+  // 可信兜底：以模型配置的 maxImagesPerRequest 为上限 clamp，前端任何越界都会被截到合规范围内。
+  const modelMaxImages = Math.max(1, Math.floor(
+    await context.resolveImageMaxImagesPerRequest(providerId, modelKey),
+  ))
+  const desiredImageCount = Math.max(
+    1,
+    Math.floor(Number((requestBody as Record<string, unknown>).count) || Number((requestBody as Record<string, unknown>).n) || 1),
+  )
+  const requestImageCount = Math.min(modelMaxImages, desiredImageCount)
+  // 写回 requestBody，让文生图链路 normalize 后透传给上游的 n 也是 clamp 后的值。
+  ;(requestBody as Record<string, unknown>).n = requestImageCount
+  delete (requestBody as Record<string, unknown>).count
+
+  if (desiredImageCount > requestImageCount) {
+    context.logGenerationTask('image_task:clamp_image_count', {
+      recordId: task.recordId,
+      userId: task.userId,
+      modelKey,
+      providerId,
+      desiredImageCount,
+      modelMaxImages,
+      appliedImageCount: requestImageCount,
+    })
+  }
+
+  const { upstreamUrl, imageUrls } = requestMode === 'image-edit'
+    ? await context.requestImageEdit({
+      signal: task.abortController.signal,
+      providerId,
+      modelKey,
+      prompt: String(requestBody.prompt || payload.prompt || '').trim(),
+      size: String(requestBody.size || '').trim() || undefined,
+      count: requestImageCount,
+      referenceImages,
+      onRetry: (retryState) => context.markTaskRetryState(task, retryState),
+    })
+    : await context.requestImageGeneration({
+      signal: task.abortController.signal,
+      providerId,
+      modelKey,
+      requestBody,
+      onRetry: (retryState) => context.markTaskRetryState(task, retryState),
+    })
+  await context.ensureTaskNotAborted(task)
+
+  context.logGenerationTask('image_task:request_upstream', {
+    recordId: task.recordId,
+    userId: task.userId,
+    upstreamUrl,
+    modelKey,
+  })
+  context.emitTaskProgressEvent(task.recordId, {
+    stage: 'receiving_upstream_result',
+    message: '上游已返回结果，正在解析图片内容',
+  })
+  context.emitTaskProgressEvent(task.recordId, {
+    stage: 'syncing_record',
+    message: '图片结果已解析，正在同步记录与资源信息',
+  })
+
+  await context.updateGenerationRecord(task.recordId, {
+    ...context.buildInitialRecordPayload(payload),
+    done: true,
+    stopped: false,
+    images: imageUrls,
+  }, task.userId)
+  const completedRecord = await context.getGenerationRecordById(task.recordId, task.userId)
+  await context.syncSharedTaskRuntime(task, 'completed')
+  context.emitTaskStreamEvent(task.recordId, {
+    type: 'completed',
+    recordId: task.recordId,
+    done: true,
+    stopped: false,
+    record: completedRecord,
+    stage: 'completed',
+    message: '图片生成完成，结果已写入记录',
+  })
+
+  context.logGenerationTask('image_task:request_success', {
+    recordId: task.recordId,
+    userId: task.userId,
+    imageCount: imageUrls.length,
+  })
+}
